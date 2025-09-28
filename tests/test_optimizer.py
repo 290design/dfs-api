@@ -34,6 +34,7 @@ def test_optimizer_endpoint_minimal_data():
         "players": [
             {
                 "player_id": 1,
+                "slate_player_id": 100,
                 "name": "Test Player",
                 "salary": 5000,
                 "value": 10.5,
@@ -57,7 +58,11 @@ def test_optimizer_endpoint_minimal_data():
     assert response.status_code == 200
 
     data = response.json()
-    assert "lineups" in data
+    assert "data" in data
+    assert "status" in data
+    assert data["status"] == 0
     assert "execution_time" in data
-    assert "success" in data
-    assert data["success"] is True or data["success"] is False  # Could fail with insufficient players
+    assert "num_lineups" in data
+    assert isinstance(data["data"], list)
+    assert "datatype" in data
+    assert data["datatype"] == "optimizer"
