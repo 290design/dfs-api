@@ -116,21 +116,33 @@ class Lineup(object):
 
         return total_value
 
-    def to_dict(self):
+    def to_dict(self, django_format=False):
         """Convert lineup to dictionary format for API response"""
-        return {
-            'players': [
+        if django_format:
+            # Django format: array of simple player objects
+            return [
                 {
-                    'player_id': player.player_id,
-                    'name': getattr(player, 'name', ''),
-                    'position': slot,
-                    'team': getattr(player, 'team_abbr', ''),
-                    'salary': getattr(player, 'salary', 0),
-                    'value': getattr(player, 'value', 0)
+                    "playerid": player.player_id,
+                    "slateplayerid": getattr(player, 'slate_player_id', 0),
+                    "position": slot
                 }
                 for slot, player in self.list_of_players
-            ],
-            'total_salary': sum([getattr(player, 'salary', 0) for _, player in self.list_of_players]),
-            'total_value': self.fitness_score,
-            'fitness_score': self.fitness_score
-        }
+            ]
+        else:
+            # Original detailed format (for debugging/testing)
+            return {
+                'players': [
+                    {
+                        'player_id': player.player_id,
+                        'name': getattr(player, 'name', ''),
+                        'position': slot,
+                        'team': getattr(player, 'team_abbr', ''),
+                        'salary': getattr(player, 'salary', 0),
+                        'value': getattr(player, 'value', 0)
+                    }
+                    for slot, player in self.list_of_players
+                ],
+                'total_salary': sum([getattr(player, 'salary', 0) for _, player in self.list_of_players]),
+                'total_value': self.fitness_score,
+                'fitness_score': self.fitness_score
+            }

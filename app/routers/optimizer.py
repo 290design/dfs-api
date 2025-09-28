@@ -10,8 +10,7 @@ router = APIRouter(prefix="/api/v2", tags=["optimizer"])
 async def optimize_lineups(request: OptimizeRequest):
     """
     Generate optimized DFS lineups using Linear Programming.
-
-    Performance: 5-10s for 25 lineups (4 vCPUs, no cold starts)
+    Returns Django-compatible format.
     """
     start_time = time.time()
 
@@ -26,20 +25,29 @@ async def optimize_lineups(request: OptimizeRequest):
 
         lineups = optimizer.lineups_with_player_positions()
 
+        # Convert to Django format: array of lineup arrays
+        lineup_data = [lineup.to_dict(django_format=True) for lineup in lineups]
+
         return OptimizeResponse(
-            lineups=[lineup.to_dict() for lineup in lineups],
+            data=lineup_data,
+            status=0,
+            datatype="optimizer",
+            maxuid=0,
+            deleteBeforeUpdate=1,
             execution_time=time.time() - start_time,
-            num_lineups=len(lineups),
-            success=True
+            num_lineups=len(lineups)
         )
 
     except Exception as e:
+        # Return empty data on error with same format
         return OptimizeResponse(
-            lineups=[],
+            data=[],
+            status=1,  # Error status
+            datatype="optimizer",
+            maxuid=0,
+            deleteBeforeUpdate=1,
             execution_time=time.time() - start_time,
-            num_lineups=0,
-            success=False,
-            error=str(e)
+            num_lineups=0
         )
 
 

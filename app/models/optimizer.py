@@ -26,8 +26,10 @@ class Lineup(BaseModel):
 
 
 class OptimizeResponse(BaseModel):
-    lineups: List[Dict[str, Any]]
-    execution_time: float
-    num_lineups: int
-    success: bool
-    error: Optional[str] = None
+    data: List[List[Dict[str, Any]]]  # Array of lineup arrays
+    status: int = 0
+    datatype: str = "optimizer"
+    maxuid: int = 0
+    deleteBeforeUpdate: int = 1
+    execution_time: Optional[float] = None
+    num_lineups: Optional[int] = None
