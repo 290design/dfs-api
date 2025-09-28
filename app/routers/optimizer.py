@@ -39,6 +39,11 @@ async def optimize_lineups(request: OptimizeRequest):
         )
 
     except Exception as e:
+        # Log the specific error for debugging
+        import traceback
+        print(f"LP Optimizer Error: {str(e)}")
+        print(f"Traceback: {traceback.format_exc()}")
+
         # Return empty data on error with same format
         return OptimizeResponse(
             data=[],

@@ -39,15 +39,29 @@ class UniversalLPOptimizer:
         self.stack = self.options.get('stack', {})
         self.stack_enabled = self.stack.get('enabled', False) if self.stack else False
 
-        # Opponent exclusion
+        # Opponent exclusion - detect showdown format (2 teams only)
         self.exclude_opp_positions = None
+        self.is_showdown = self._is_showdown_format()
+
         if self.options.get('exclude_opp_roster_slots', {}).get('enabled', False):
-            self.exclude_opp_positions = self.options['exclude_opp_roster_slots'].get('roster_slot_map', {})
+            if self.is_showdown:
+                print("Showdown format detected (2 teams) - disabling opponent exclusion constraints")
+                self.exclude_opp_positions = None
+            else:
+                self.exclude_opp_positions = self.options['exclude_opp_roster_slots'].get('roster_slot_map', {})
 
         # Store generated lineups
         self.generated_lineups = []
         self.exclusion_constraints = []
         self.player_appearances = {}  # Track {player_id: appearance_count}
+
+    def _is_showdown_format(self):
+        """
+        Detect if this is a showdown format (only 2 teams)
+        """
+        teams = set(getattr(p, 'team_abbr', '') for p in self.player_pool)
+        teams = {team for team in teams if team}  # Remove empty strings
+        return len(teams) <= 2
 
     def create_lp_model(self):
         """
@@ -56,48 +70,62 @@ class UniversalLPOptimizer:
         # Create the model
         model = pulp.LpProblem("DFS_Optimizer", pulp.LpMaximize)
 
-        # Decision variables: binary variable for each (player, roster_slot) combination
+        # Build position-based player pools like genetic solver
+        players_by_position = {}
+        for slot in set(self.roster_slots):
+            players_by_position[slot] = [p for p in self.player_pool
+                                        if slot in getattr(p, 'roster_slots', [])]
+
+        # Decision variables: binary variable for each eligible player in each roster slot
         player_vars = {}
-        for player in self.player_pool:
-            for slot_idx, slot in enumerate(self.roster_slots):
-                if slot in getattr(player, 'roster_slots', []):
-                    var_name = f"player_{player.player_id}_slot_{slot}_{slot_idx}"
-                    player_vars[(player.player_id, slot, slot_idx)] = pulp.LpVariable(
-                        var_name, cat='Binary'
-                    )
+        for slot_idx, slot in enumerate(self.roster_slots):
+            eligible_players = players_by_position.get(slot, [])
+            for player_idx, player in enumerate(eligible_players):
+                var_name = f"player_{player.slate_player_id}_slot_{slot}_{slot_idx}"
+                key = (player.slate_player_id, slot, slot_idx)
+                player_vars[key] = pulp.LpVariable(var_name, cat='Binary')
 
         # Calculate exposure adjustments
         exposure_multipliers = self._calculate_exposure_multipliers()
 
+        # Create lookup for slate_player_id to player object
+        slate_player_dict = {getattr(p, 'slate_player_id', p.player_id): p for p in self.player_pool}
+
         # Objective function: maximize total value with multipliers and exposure adjustments
         objective = []
-        for (player_id, slot, slot_idx), var in player_vars.items():
-            player = self.player_dict[player_id]
+        for (slate_player_id, slot, slot_idx), var in player_vars.items():
+            player = slate_player_dict[slate_player_id]
             value = getattr(player, 'value', 0)
             multiplier = self.multipliers.get(slot, 1.0)
-            exposure_mult = exposure_multipliers.get(player_id, 1.0)
+            exposure_mult = exposure_multipliers.get(player.player_id, 1.0)
             objective.append(value * multiplier * exposure_mult * var)
 
         model += pulp.lpSum(objective)
 
         # Constraint 1: Each roster slot must be filled exactly once
         for slot_idx, slot in enumerate(self.roster_slots):
-            slot_vars = [var for (pid, s, sidx), var in player_vars.items()
+            slot_vars = [var for (slate_player_id, s, sidx), var in player_vars.items()
                         if s == slot and sidx == slot_idx]
             if slot_vars:
                 model += pulp.lpSum(slot_vars) == 1, f"fill_slot_{slot}_{slot_idx}"
 
         # Constraint 2: Each player can be used at most once across all positions
-        for player in self.player_pool:
-            player_vars_list = [var for (pid, s, sidx), var in player_vars.items()
-                               if pid == player.player_id]
-            if player_vars_list:
-                model += pulp.lpSum(player_vars_list) <= 1, f"player_once_{player.player_id}"
+        # Group by player_id to handle showdown format where same player appears multiple times
+        player_id_to_vars = {}
+        for (slate_player_id, slot, slot_idx), var in player_vars.items():
+            player = slate_player_dict[slate_player_id]
+            player_id = player.player_id
+            if player_id not in player_id_to_vars:
+                player_id_to_vars[player_id] = []
+            player_id_to_vars[player_id].append(var)
+
+        for player_id, vars_list in player_id_to_vars.items():
+            model += pulp.lpSum(vars_list) <= 1, f"player_once_{player_id}"
 
         # Constraint 3: Salary cap
         salary_terms = []
-        for (player_id, slot, slot_idx), var in player_vars.items():
-            player = self.player_dict[player_id]
+        for (slate_player_id, slot, slot_idx), var in player_vars.items():
+            player = slate_player_dict[slate_player_id]
             salary = getattr(player, 'salary', 0)
             salary_terms.append(salary * var)
 
@@ -110,8 +138,8 @@ class UniversalLPOptimizer:
             teams = set(getattr(p, 'team_abbr', '') for p in self.player_pool)
             for team in teams:
                 if team:
-                    team_vars = [var for (pid, s, sidx), var in player_vars.items()
-                                if getattr(self.player_dict[pid], 'team_abbr', '') == team]
+                    team_vars = [var for (slate_player_id, s, sidx), var in player_vars.items()
+                                if getattr(slate_player_dict[slate_player_id], 'team_abbr', '') == team]
                     if team_vars:
                         model += pulp.lpSum(team_vars) <= self.max_per_team, f"max_team_{team}"
 
@@ -124,11 +152,13 @@ class UniversalLPOptimizer:
             self._add_stack_constraints(model, player_vars)
 
         # Constraint 7A: Prevent exact duplicates from ALL previous lineups (lightweight)
+        slate_player_dict = {getattr(p, 'slate_player_id', p.player_id): p for p in self.player_pool}
         for idx, excluded_player_ids in enumerate(self.exclusion_constraints):
             exclusion_vars = []
             for player_id in excluded_player_ids:
                 # Get ALL variables for this player across all their possible slots
-                player_all_vars = [var for (pid, s, sidx), var in player_vars.items() if pid == player_id]
+                player_all_vars = [var for (slate_player_id, s, sidx), var in player_vars.items()
+                                 if slate_player_dict[slate_player_id].player_id == player_id]
                 exclusion_vars.extend(player_all_vars)
 
             if exclusion_vars:
@@ -219,8 +249,11 @@ class UniversalLPOptimizer:
         """
         Add constraints to prevent players from being paired with opponent positions
         """
-        for (player_id, slot, slot_idx), var in player_vars.items():
-            player = self.player_dict[player_id]
+        # Create lookup for slate_player_id to player object
+        slate_player_dict = {getattr(p, 'slate_player_id', p.player_id): p for p in self.player_pool}
+
+        for (slate_player_id, slot, slot_idx), var in player_vars.items():
+            player = slate_player_dict[slate_player_id]
             player_position = getattr(player, 'position_abbr', '')
             player_opponent = getattr(player, 'opponent_abbr', '')
 
@@ -238,13 +271,14 @@ class UniversalLPOptimizer:
                         other_position in excluded_positions):
 
                         # Get all variables for the opponent player
-                        opponent_vars = [v for (pid, s, sidx), v in player_vars.items()
-                                       if pid == other_player.player_id]
+                        other_slate_id = getattr(other_player, 'slate_player_id', other_player.player_id)
+                        opponent_vars = [v for (spid, s, sidx), v in player_vars.items()
+                                       if spid == other_slate_id]
 
                         # Add constraint: if current player is selected, opponent cannot be selected
                         if opponent_vars:
                             model += var + pulp.lpSum(opponent_vars) <= 1, \
-                                   f"exclude_opp_{player.player_id}_{slot}_{slot_idx}_{other_player.player_id}"
+                                   f"exclude_opp_{slate_player_id}_{slot}_{slot_idx}_{other_slate_id}"
 
     def _add_stack_constraints(self, model, player_vars):
         """
@@ -277,8 +311,9 @@ class UniversalLPOptimizer:
             team_stack_var = pulp.LpVariable(f"stack_team_{team}", cat='Binary')
 
             # Get variables for players from this team
-            team_vars = [var for (pid, s, sidx), var in player_vars.items()
-                        if getattr(self.player_dict[pid], 'team_abbr', '') == team]
+            slate_player_dict = {getattr(p, 'slate_player_id', p.player_id): p for p in self.player_pool}
+            team_vars = [var for (slate_player_id, s, sidx), var in player_vars.items()
+                        if getattr(slate_player_dict[slate_player_id], 'team_abbr', '') == team]
 
             if team_vars:
                 # If team is stacked, must have at least total_players from team
@@ -295,8 +330,8 @@ class UniversalLPOptimizer:
                     position = group.get('value', '')
                     if position:
                         # Must have at least one player from this position if team is stacked
-                        position_vars = [var for (pid, s, sidx), var in player_vars.items()
-                                       if (getattr(self.player_dict[pid], 'team_abbr', '') == team and
+                        position_vars = [var for (slate_player_id, s, sidx), var in player_vars.items()
+                                       if (getattr(slate_player_dict[slate_player_id], 'team_abbr', '') == team and
                                            s == position)]
 
                         if position_vars:
@@ -324,8 +359,11 @@ class UniversalLPOptimizer:
         for idx, prev_lineup_players in enumerate(recent_lineups):
             # Get variables for players in previous lineup
             prev_vars = []
+            slate_player_dict = {getattr(p, 'slate_player_id', p.player_id): p for p in self.player_pool}
             for player_id in prev_lineup_players:
-                player_all_vars = [var for (pid, s, sidx), var in player_vars.items() if pid == player_id]
+                # Find all slate_player_ids for this player_id
+                player_all_vars = [var for (slate_player_id, s, sidx), var in player_vars.items()
+                                 if slate_player_dict[slate_player_id].player_id == player_id]
                 prev_vars.extend(player_all_vars)
 
             if prev_vars:
@@ -403,18 +441,23 @@ class UniversalLPOptimizer:
             time.sleep(self._test_delay_seconds)
 
         if model.status != pulp.LpStatusOptimal:
+            print(f"LP Model failed with status: {pulp.LpStatus[model.status]}")
+            if hasattr(self, 'is_showdown') and self.is_showdown:
+                print(f"Showdown format: {self.is_showdown}, teams detected: {len(set(getattr(p, 'team_abbr', '') for p in self.player_pool))}")
             return None
 
         # Extract solution
+        slate_player_dict = {getattr(p, 'slate_player_id', p.player_id): p for p in self.player_pool}
         lineup_players = []
-        for (player_id, slot, slot_idx), var in player_vars.items():
+        for (slate_player_id, slot, slot_idx), var in player_vars.items():
             if var.varValue and var.varValue > 0.5:  # Binary variable is 1
-                player = self.player_dict[player_id]
+                player = slate_player_dict[slate_player_id]
                 lineup_players.append((slot, player))
 
         if len(lineup_players) == len(self.roster_slots):
             # Create exclusion constraint for this lineup - track unique player IDs only
-            selected_player_ids = [player_id for (player_id, slot, slot_idx), var in player_vars.items()
+            selected_player_ids = [slate_player_dict[slate_player_id].player_id
+                                 for (slate_player_id, slot, slot_idx), var in player_vars.items()
                                  if var.varValue and var.varValue > 0.5]
             exclusion = list(set(selected_player_ids))  # Unique player IDs only
             self.exclusion_constraints.append(exclusion)
